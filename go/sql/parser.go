@@ -9,6 +9,8 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"github.com/outbrain/golib/log"
+	"fmt"
 )
 
 var (
@@ -29,6 +31,10 @@ func NewParser() *Parser {
 		columnRenameMap: make(map[string]string),
 		droppedColumns:  make(map[string]bool),
 	}
+}
+
+func (this *Parser) String() string {
+	return fmt.Sprintf("columnRenameMap:%v, droppedColumns: %v, isRenameTable:%v", this.columnRenameMap,this.droppedColumns, this.isRenameTable)
 }
 
 func (this *Parser) tokenizeAlterStatement(alterStatement string) (tokens []string, err error) {
@@ -100,6 +106,7 @@ func (this *Parser) parseAlterToken(alterToken string) (err error) {
 func (this *Parser) ParseAlterStatement(alterStatement string) (err error) {
 	alterTokens, _ := this.tokenizeAlterStatement(alterStatement)
 	for _, alterToken := range alterTokens {
+		log.Info(alterToken)
 		alterToken = this.sanitizeQuotesFromAlterStatement(alterToken)
 		this.parseAlterToken(alterToken)
 	}

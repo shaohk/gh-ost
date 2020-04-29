@@ -304,6 +304,7 @@ func (this *Applier) WriteChangelogState(value string) (string, error) {
 
 // InitiateHeartbeat creates a heartbeat cycle, writing to the changelog table.
 // This is done asynchronously
+// 发起一个循环心跳
 func (this *Applier) InitiateHeartbeat() {
 	var numSuccessiveFailures int64
 	injectHeartbeat := func() error {
@@ -357,6 +358,7 @@ func (this *Applier) ExecuteThrottleQuery() (int64, error) {
 func (this *Applier) ReadMigrationMinValues(uniqueKey *sql.UniqueKey) error {
 	log.Debugf("Reading migration range according to key: %s", uniqueKey.Name)
 	query, err := sql.BuildUniqueKeyMinValuesPreparedQuery(this.migrationContext.DatabaseName, this.migrationContext.OriginalTableName, &uniqueKey.Columns)
+	log.Infof("query: %s")
 	if err != nil {
 		return err
 	}
@@ -378,6 +380,7 @@ func (this *Applier) ReadMigrationMinValues(uniqueKey *sql.UniqueKey) error {
 func (this *Applier) ReadMigrationMaxValues(uniqueKey *sql.UniqueKey) error {
 	log.Debugf("Reading migration range according to key: %s", uniqueKey.Name)
 	query, err := sql.BuildUniqueKeyMaxValuesPreparedQuery(this.migrationContext.DatabaseName, this.migrationContext.OriginalTableName, &uniqueKey.Columns)
+	log.Infof("query: %s")
 	if err != nil {
 		return err
 	}
@@ -492,6 +495,7 @@ func (this *Applier) ApplyIterationInsertQuery() (chunkSize int64, rowsAffected 
 		if _, err := tx.Exec(sessionQuery); err != nil {
 			return nil, err
 		}
+		log.Info("%s/%s", query, explodedArgs)
 		result, err := tx.Exec(query, explodedArgs...)
 		if err != nil {
 			return nil, err

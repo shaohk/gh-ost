@@ -62,12 +62,29 @@ const (
 
 // Migrator is the main schema migration flow manager.
 type Migrator struct {
+	// alter操作的解析
 	parser           *sql.Parser
+
+	// inspector: 检查员，负责检查
+	// 1、MySQL连通性，顺便保存了MySQL链接connection句柄
+	// 2、MySQL版本
+	// 3、当前用户是否有权限
+	// 4、binlog是否开启，以及binlog的格式
 	inspector        *Inspector
+
+	// 检测历史表，创建binlog表，ghost影子表，直接在影子表中执行alter语句
 	applier          *Applier
+
+	// binlog事件流，内部处理binlog同步并解析事件类型，然后发送到channel中，同时启动了监听者用来监听处理channel中的消息
 	eventsStreamer   *EventsStreamer
+
+	// 这个server提供在线对gh-ost进程进行状态查询和参数配置
 	server           *Server
+
+
 	throttler        *Throttler
+
+	// 钩子，在gh-ost执行的各个生命周期节点会检测调用钩子
 	hooksExecutor    *HooksExecutor
 	migrationContext *base.MigrationContext
 
@@ -77,9 +94,13 @@ type Migrator struct {
 	allEventsUpToLockProcessed chan string
 
 	rowCopyCompleteFlag int64
+
 	// copyRowsQueue should not be buffered; if buffered some non-damaging but
 	//  excessive work happens at the end of the iteration as new copy-jobs arrive before realizing the copy is complete
+	// 拷贝数据生成event发送到此队列
 	copyRowsQueue    chan tableWriteFunc
+
+	// 读取binlog生成的event发送到此队列
 	applyEventsQueue chan *applyEventStruct
 
 	handledChangelogStates map[string]bool
@@ -300,6 +321,8 @@ func (this *Migrator) countTableRows() (err error) {
 	return countRowsFunc()
 }
 
+
+// 创建标志文件
 func (this *Migrator) createFlagFiles() (err error) {
 	if this.migrationContext.PostponeCutOverFlagFile != "" {
 		if !base.FileExists(this.migrationContext.PostponeCutOverFlagFile) {
@@ -331,6 +354,7 @@ func (this *Migrator) Migrate() (err error) {
 	if err := this.parser.ParseAlterStatement(this.migrationContext.AlterStatement); err != nil {
 		return err
 	}
+	log.Infof("%s", this.parser.String())
 	if err := this.validateStatement(); err != nil {
 		return err
 	}
@@ -373,6 +397,7 @@ func (this *Migrator) Migrate() (err error) {
 	}
 	defer this.server.RemoveSocketFile()
 
+	// 统计当前table的count
 	if err := this.countTableRows(); err != nil {
 		return err
 	}
@@ -388,6 +413,7 @@ func (this *Migrator) Migrate() (err error) {
 	if err := this.hooksExecutor.onBeforeRowCopy(); err != nil {
 		return err
 	}
+	// 开始执行写操作，包括影子表导入和binlog的写入
 	go this.executeWriteFuncs()
 	go this.iterateChunks()
 	this.migrationContext.MarkRowCopyStartTime()
@@ -1048,6 +1074,7 @@ func (this *Migrator) initiateThrottler() error {
 	return nil
 }
 
+// 初始化applier，检测历史表，创建binlog表，ghost影子表，直接在影子表中执行alter语句
 func (this *Migrator) initiateApplier() error {
 	this.applier = NewApplier(this.migrationContext)
 	if err := this.applier.InitDBConnections(); err != nil {
@@ -1070,6 +1097,7 @@ func (this *Migrator) initiateApplier() error {
 		return err
 	}
 
+	// GhostTableMigrated：影子表已经alter完成的标志位，通知相关协程，已经准备就绪了
 	this.applier.WriteChangelogState(string(GhostTableMigrated))
 	go this.applier.InitiateHeartbeat()
 	return nil
@@ -1248,7 +1276,7 @@ func (this *Migrator) executeWriteFuncs() error {
 						// Hmmmmm... nothing in the queue; no events, but also no row copy.
 						// This is possible upon load. Let's just sleep it over.
 						log.Debugf("Getting nothing in the write queue. Sleeping...")
-						time.Sleep(time.Second)
+						time.Sleep(time.Second * 5)
 					}
 				}
 			}

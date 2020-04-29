@@ -79,6 +79,7 @@ func (this *HooksExecutor) applyEnvironmentVariables(extraVariables ...string) [
 // executeHook executes a command, and sets relevant environment variables
 // combined output & error are printed to gh-ost's standard error.
 func (this *HooksExecutor) executeHook(hook string, extraVariables ...string) error {
+	log.Info("============%s", hook)
 	cmd := exec.Command(hook)
 	cmd.Env = this.applyEnvironmentVariables(extraVariables...)
 

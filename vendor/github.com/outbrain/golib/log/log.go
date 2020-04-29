@@ -23,6 +23,7 @@ import (
 	"os"
 	"runtime/debug"
 	"time"
+	"runtime"
 )
 
 // LogLevel indicates the severity of a log entry
@@ -122,12 +123,13 @@ func SetSyslogLevel(logLevel LogLevel) {
 }
 
 // logFormattedEntry nicely formats and emits a log entry
-func logFormattedEntry(logLevel LogLevel, message string, args ...interface{}) string {
+func logFormattedEntry(logLevel LogLevel, message string, skip int, args ...interface{}) string {
 	if logLevel > globalLogLevel {
 		return ""
 	}
 	msgArgs := fmt.Sprintf(message, args...)
-	entryString := fmt.Sprintf("%s %s %s", time.Now().Format(TimeFormat), logLevel, msgArgs)
+	_, file, line, _ := runtime.Caller(skip)
+	entryString := fmt.Sprintf("%s %s %s:%d %s", time.Now().Format(TimeFormat), logLevel, file, line, msgArgs)
 	fmt.Fprintln(os.Stderr, entryString)
 
 	if syslogWriter != nil {
@@ -158,12 +160,12 @@ func logFormattedEntry(logLevel LogLevel, message string, args ...interface{}) s
 }
 
 // logEntry emits a formatted log entry
-func logEntry(logLevel LogLevel, message string, args ...interface{}) string {
+func logEntry(logLevel LogLevel, message string, skip int, args ...interface{}) string {
 	entryString := message
 	for _, s := range args {
 		entryString += fmt.Sprintf(" %s", s)
 	}
-	return logFormattedEntry(logLevel, entryString)
+	return logFormattedEntry(logLevel, entryString, skip)
 }
 
 // logErrorEntry emits a log entry based on given error object
@@ -173,7 +175,7 @@ func logErrorEntry(logLevel LogLevel, err error) error {
 		return nil
 	}
 	entryString := fmt.Sprintf("%+v", err)
-	logEntry(logLevel, entryString)
+	logEntry(logLevel, entryString, 3)
 	if printStackTrace {
 		debug.PrintStack()
 	}
@@ -181,43 +183,43 @@ func logErrorEntry(logLevel LogLevel, err error) error {
 }
 
 func Debug(message string, args ...interface{}) string {
-	return logEntry(DEBUG, message, args...)
+	return logEntry(DEBUG, message,3,  args...)
 }
 
 func Debugf(message string, args ...interface{}) string {
-	return logFormattedEntry(DEBUG, message, args...)
+	return logFormattedEntry(DEBUG, message,2, args...)
 }
 
 func Info(message string, args ...interface{}) string {
-	return logEntry(INFO, message, args...)
+	return logEntry(INFO, message,3, args...)
 }
 
 func Infof(message string, args ...interface{}) string {
-	return logFormattedEntry(INFO, message, args...)
+	return logFormattedEntry(INFO, message,2, args...)
 }
 
 func Notice(message string, args ...interface{}) string {
-	return logEntry(NOTICE, message, args...)
+	return logEntry(NOTICE, message,3, args...)
 }
 
 func Noticef(message string, args ...interface{}) string {
-	return logFormattedEntry(NOTICE, message, args...)
+	return logFormattedEntry(NOTICE, message,2, args...)
 }
 
 func Warning(message string, args ...interface{}) error {
-	return errors.New(logEntry(WARNING, message, args...))
+	return errors.New(logEntry(WARNING, message,4, args...))
 }
 
 func Warningf(message string, args ...interface{}) error {
-	return errors.New(logFormattedEntry(WARNING, message, args...))
+	return errors.New(logFormattedEntry(WARNING, message,3, args...))
 }
 
 func Error(message string, args ...interface{}) error {
-	return errors.New(logEntry(ERROR, message, args...))
+	return errors.New(logEntry(ERROR, message,4, args...))
 }
 
 func Errorf(message string, args ...interface{}) error {
-	return errors.New(logFormattedEntry(ERROR, message, args...))
+	return errors.New(logFormattedEntry(ERROR, message,3, args...))
 }
 
 func Errore(err error) error {
@@ -225,11 +227,11 @@ func Errore(err error) error {
 }
 
 func Critical(message string, args ...interface{}) error {
-	return errors.New(logEntry(CRITICAL, message, args...))
+	return errors.New(logEntry(CRITICAL, message,4, args...))
 }
 
 func Criticalf(message string, args ...interface{}) error {
-	return errors.New(logFormattedEntry(CRITICAL, message, args...))
+	return errors.New(logFormattedEntry(CRITICAL, message,3, args...))
 }
 
 func Criticale(err error) error {
@@ -238,16 +240,16 @@ func Criticale(err error) error {
 
 // Fatal emits a FATAL level entry and exists the program
 func Fatal(message string, args ...interface{}) error {
-	logEntry(FATAL, message, args...)
+	logEntry(FATAL, message,3, args...)
 	os.Exit(1)
-	return errors.New(logEntry(CRITICAL, message, args...))
+	return errors.New(logEntry(CRITICAL, message,4, args...))
 }
 
 // Fatalf emits a FATAL level entry and exists the program
 func Fatalf(message string, args ...interface{}) error {
-	logFormattedEntry(FATAL, message, args...)
+	logFormattedEntry(FATAL, message,2, args...)
 	os.Exit(1)
-	return errors.New(logFormattedEntry(CRITICAL, message, args...))
+	return errors.New(logFormattedEntry(CRITICAL, message,3, args...))
 }
 
 // Fatale emits a FATAL level entry and exists the program

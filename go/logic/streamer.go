@@ -39,9 +39,15 @@ type EventsStreamer struct {
 	db                       *gosql.DB
 	migrationContext         *base.MigrationContext
 	initialBinlogCoordinates *mysql.BinlogCoordinates
+
+	// binlog监听者列表
 	listeners                [](*BinlogEventListener)
 	listenersMutex           *sync.Mutex
+
+	// binlog的事件管道
 	eventsChannel            chan *binlog.BinlogEntry
+
+	// binlog的订阅者，内部维护了binlog的数据流
 	binlogReader             *binlog.GoMySQLReader
 }
 
@@ -56,6 +62,7 @@ func NewEventsStreamer(migrationContext *base.MigrationContext) *EventsStreamer 
 }
 
 // AddListener registers a new listener for binlog events, on a per-table basis
+// 注册一个监听binlog的监听者
 func (this *EventsStreamer) AddListener(
 	async bool, databaseName string, tableName string, onDmlEvent func(event *binlog.BinlogDMLEvent) error) (err error) {
 
@@ -121,11 +128,14 @@ func (this *EventsStreamer) InitDBConnections() (err error) {
 }
 
 // initBinlogReader creates and connects the reader: we hook up to a MySQL server as a replica
+// 创建一个MySQL的replica读链接
 func (this *EventsStreamer) initBinlogReader(binlogCoordinates *mysql.BinlogCoordinates) error {
+	// 创建一个binlog reader
 	goMySQLReader, err := binlog.NewGoMySQLReader(this.migrationContext)
 	if err != nil {
 		return err
 	}
+	// 根据当前binlog位置创建一个binlog的数据流并开始同步
 	if err := goMySQLReader.ConnectBinlogStreamer(*binlogCoordinates); err != nil {
 		return err
 	}
@@ -142,6 +152,7 @@ func (this *EventsStreamer) GetReconnectBinlogCoordinates() *mysql.BinlogCoordin
 }
 
 // readCurrentBinlogCoordinates reads master status from hooked server
+// 读取当前binlog的位置信息
 func (this *EventsStreamer) readCurrentBinlogCoordinates() error {
 	query := `show /* gh-ost readCurrentBinlogCoordinates */ master status`
 	foundMasterStatus := false
@@ -167,6 +178,7 @@ func (this *EventsStreamer) readCurrentBinlogCoordinates() error {
 // StreamEvents will begin streaming events. It will be blocking, so should be
 // executed by a goroutine
 func (this *EventsStreamer) StreamEvents(canStopStreaming func() bool) error {
+	// 启动监听binlog事件的监听，收到binlog dml事件后交给binlog监听者处理
 	go func() {
 		for binlogEntry := range this.eventsChannel {
 			if binlogEntry.DmlEvent != nil {
@@ -177,6 +189,7 @@ func (this *EventsStreamer) StreamEvents(canStopStreaming func() bool) error {
 	// The next should block and execute forever, unless there's a serious error
 	var successiveFailures int64
 	var lastAppliedRowsEventHint mysql.BinlogCoordinates
+	// 开始读取binlog并将event发送到eventsChannel中
 	for {
 		if canStopStreaming() {
 			return nil

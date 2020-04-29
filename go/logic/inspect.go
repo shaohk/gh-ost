@@ -117,7 +117,9 @@ func (this *Inspector) InspectOriginalTable() (err error) {
 // makes sense and is valid. It extracts the list of shared columns and the chosen migration unique key
 func (this *Inspector) inspectOriginalAndGhostTables() (err error) {
 	originalNamesOnApplier := this.migrationContext.OriginalTableColumnsOnApplier.Names()
+	log.Infof("originalNamesOnApplier: %v", originalNamesOnApplier)
 	originalNames := this.migrationContext.OriginalTableColumns.Names()
+	log.Infof("originalNamesOnApplier: %v", originalNamesOnApplier)
 	if !reflect.DeepEqual(originalNames, originalNamesOnApplier) {
 		return fmt.Errorf("It seems like table structure is not identical between master and replica. This scenario is not supported.")
 	}
@@ -127,6 +129,7 @@ func (this *Inspector) inspectOriginalAndGhostTables() (err error) {
 		return err
 	}
 	sharedUniqueKeys, err := this.getSharedUniqueKeys(this.migrationContext.OriginalTableUniqueKeys, this.migrationContext.GhostTableUniqueKeys)
+	log.Infof("sharedUniqueKeys: %v")
 	if err != nil {
 		return err
 	}
@@ -215,6 +218,7 @@ func (this *Inspector) validateGrants() error {
 	foundDBAll := false
 
 	err := sqlutils.QueryRowsMap(this.db, query, func(rowMap sqlutils.RowMap) error {
+		log.Infof("%v", rowMap)
 		for _, grantData := range rowMap {
 			grant := grantData.String
 			if strings.Contains(grant, `GRANT ALL PRIVILEGES ON *.*`) {
