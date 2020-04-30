@@ -377,12 +377,14 @@ func (this *Throttler) collectGeneralThrottleMetrics() error {
 	if atomic.LoadInt64(&this.migrationContext.ThrottleCommandedByUser) > 0 {
 		return setThrottle(true, "commanded by user", base.UserCommandThrottleReasonHint)
 	}
+	// 通过标志文件检测是否需要限流
 	if this.migrationContext.ThrottleFlagFile != "" {
 		if base.FileExists(this.migrationContext.ThrottleFlagFile) {
 			// Throttle file defined and exists!
 			return setThrottle(true, "flag-file", base.NoThrottleReasonHint)
 		}
 	}
+	// 通过标志文件检测是否需要限流，为啥要设置两个标志文件呢？没看懂
 	if this.migrationContext.ThrottleAdditionalFlagFile != "" {
 		if base.FileExists(this.migrationContext.ThrottleAdditionalFlagFile) {
 			// 2nd Throttle file defined and exists!
@@ -417,6 +419,7 @@ func (this *Throttler) initiateThrottlerCollection(firstThrottlingCollected chan
 	go this.collectControlReplicasLag()
 	go this.collectThrottleHTTPStatus(firstThrottlingCollected)
 
+	// 启动限流检测的协程，1s检测一次
 	go func() {
 		this.collectGeneralThrottleMetrics()
 		firstThrottlingCollected <- true
@@ -464,6 +467,7 @@ func (this *Throttler) initiateThrottlerChecks() error {
 
 // throttle sees if throttling needs take place, and if so, continuously sleeps (blocks)
 // until throttling reasons are gone
+// 查看是否限流，如果限流标志位置位，就sleep
 func (this *Throttler) throttle(onThrottled func()) {
 	for {
 		// IsThrottled() is non-blocking; the throttling decision making takes place asynchronously.

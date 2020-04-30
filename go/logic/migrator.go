@@ -81,7 +81,7 @@ type Migrator struct {
 	// 这个server提供在线对gh-ost进程进行状态查询和参数配置
 	server           *Server
 
-
+	// 限流器，用户通过server传入限流指令，然后throttler会定时检测限流，如果有限流，就暂停任务
 	throttler        *Throttler
 
 	// 钩子，在gh-ost执行的各个生命周期节点会检测调用钩子
@@ -126,6 +126,7 @@ func NewMigrator(context *base.MigrationContext) *Migrator {
 }
 
 // initiateHooksExecutor
+// 初始化钩子执行器，为后续在各个生命周期出发的钩子做保障
 func (this *Migrator) initiateHooksExecutor() (err error) {
 	this.hooksExecutor = NewHooksExecutor(this.migrationContext)
 	if err := this.hooksExecutor.initHooks(); err != nil {
@@ -151,6 +152,7 @@ func (this *Migrator) sleepWhileTrue(operation func() (bool, error)) error {
 
 // retryOperation attempts up to `count` attempts at running given function,
 // exiting as soon as it returns with non-error.
+// 一个重试函数
 func (this *Migrator) retryOperation(operation func() error, notFatalHint ...bool) (err error) {
 	maxRetries := int(this.migrationContext.MaxRetries())
 	for i := 0; i < maxRetries; i++ {
@@ -210,6 +212,7 @@ func (this *Migrator) executeAndThrottleOnError(operation func() error) (err err
 
 // consumeRowCopyComplete blocks on the rowCopyComplete channel once, and then
 // consumes and drops any further incoming events that may be left hanging.
+// 检测copy结束的信号，此处的结束包含异常的结束
 func (this *Migrator) consumeRowCopyComplete() {
 	if err := <-this.rowCopyComplete; err != nil {
 		this.migrationContext.PanicAbort <- err
@@ -292,6 +295,7 @@ func (this *Migrator) validateStatement() (err error) {
 	return nil
 }
 
+// 检测原表的数据条数count(*)
 func (this *Migrator) countTableRows() (err error) {
 	if !this.migrationContext.CountTableRows {
 		// Not counting; we stay with an estimate
@@ -322,7 +326,7 @@ func (this *Migrator) countTableRows() (err error) {
 }
 
 
-// 创建标志文件
+// 创建PostponeCutOverFlagFile标志文件
 func (this *Migrator) createFlagFiles() (err error) {
 	if this.migrationContext.PostponeCutOverFlagFile != "" {
 		if !base.FileExists(this.migrationContext.PostponeCutOverFlagFile) {
@@ -415,8 +419,10 @@ func (this *Migrator) Migrate() (err error) {
 	}
 	// 开始执行写操作，包括影子表导入和binlog的写入
 	go this.executeWriteFuncs()
+	// 开始迭代拷贝原表数据到影子表
 	go this.iterateChunks()
 	this.migrationContext.MarkRowCopyStartTime()
+
 	go this.initiateStatus()
 
 	log.Debugf("Operating until row copy is complete")
@@ -431,11 +437,15 @@ func (this *Migrator) Migrate() (err error) {
 		return err
 	}
 	var retrier func(func() error, ...bool) error
+
 	if this.migrationContext.CutOverExponentialBackoff {
+		// 指数级重试
 		retrier = this.retryOperationWithExponentialBackoff
 	} else {
+		// 正常的重试
 		retrier = this.retryOperation
 	}
+	// 开始rename表
 	if err := retrier(this.cutOver); err != nil {
 		return err
 	}
@@ -499,6 +509,7 @@ func (this *Migrator) cutOver() (err error) {
 		log.Debugf("throttling before swapping tables")
 	})
 
+	// 推迟cut-over的处理逻辑
 	this.migrationContext.MarkPointOfInterest()
 	log.Debugf("checking for cut-over postpone")
 	this.sleepWhileTrue(
@@ -1105,7 +1116,9 @@ func (this *Migrator) initiateApplier() error {
 
 // iterateChunks iterates the existing table rows, and generates a copy task of
 // a chunk of rows onto the ghost table.
+// 开始迭代从原表往影子表copy数据
 func (this *Migrator) iterateChunks() error {
+	// 终止copy的err处理
 	terminateRowIteration := func(err error) error {
 		this.rowCopyComplete <- err
 		return log.Errore(err)
@@ -1174,6 +1187,7 @@ func (this *Migrator) iterateChunks() error {
 			return nil
 		}
 		// Enqueue copy operation; to be executed by executeWriteFuncs()
+		// 把copy数据的func发送到队列里(阻塞)，供写入方执行
 		this.copyRowsQueue <- copyRowsFunc
 	}
 	return nil
@@ -1243,11 +1257,15 @@ func (this *Migrator) executeWriteFuncs() error {
 			return nil
 		}
 
-		this.throttler.throttle(nil)
+		// 检测限流是否打开
+		this.throttler.throttle(func() {
+			log.Infof("正在限流中")
+		})
 
 		// We give higher priority to event processing, then secondary priority to
 		// rowcopy
 		select {
+		// 读取binlog事件
 		case eventStruct := <-this.applyEventsQueue:
 			{
 				if err := this.onApplyEventStruct(eventStruct); err != nil {
@@ -1257,6 +1275,7 @@ func (this *Migrator) executeWriteFuncs() error {
 		default:
 			{
 				select {
+				// 从原表拷贝数据到影子表使用的队列
 				case copyRowsFunc := <-this.copyRowsQueue:
 					{
 						copyRowsStartTime := time.Now()
