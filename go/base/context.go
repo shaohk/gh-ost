@@ -230,6 +230,9 @@ type MigrationContext struct {
 	MigrationIterationRangeMaxValues *sql.ColumnValues
 	ForceTmpTableName                string
 
+	EnableCheckSum    bool
+	CheckSumChunkSize int
+
 	recentBinlogCoordinates mysql.BinlogCoordinates
 
 	BinlogSyncerMaxReconnectAttempts int

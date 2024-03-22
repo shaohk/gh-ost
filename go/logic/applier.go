@@ -670,6 +670,41 @@ func (this *Applier) ApplyIterationInsertQuery() (chunkSize int64, rowsAffected 
 	return chunkSize, rowsAffected, duration, nil
 }
 
+func (this *Applier) CheckSumChunk(chunk *checkSumChunk) (err error) {
+	if chunk.checkSQLQuery == "" {
+		chunk.checkSQLQuery, chunk.checkSQLArgs, err = sql.BuildRangeCheckSumPreparedQuery(
+			this.migrationContext.DatabaseName,
+			this.migrationContext.OriginalTableName,
+			this.migrationContext.GetGhostTableName(),
+			this.migrationContext.SharedColumns.Names(),
+			this.migrationContext.MappedSharedColumns.Names(),
+			this.migrationContext.UniqueKey.Name,
+			&this.migrationContext.UniqueKey.Columns,
+			chunk.min.AbstractValues(),
+			chunk.max.AbstractValues(),
+			this.migrationContext.GetIteration() == 0,
+			this.migrationContext.IsTransactionalTable(),
+			1024,
+		)
+		if err != nil {
+			return err
+		}
+		chunk.firstCheckTime = time.Now()
+	}
+
+	var result int
+	err = this.db.QueryRow(chunk.checkSQLQuery, chunk.checkSQLArgs...).Scan(&result)
+	if err != nil {
+		return err
+	}
+
+	if result > 0 {
+		return fmt.Errorf("checksum inconsistent checksum sql: %s, args: %s", chunk.checkSQLQuery, chunk.checkSQLArgs)
+	}
+
+	return nil
+}
+
 // LockOriginalTable places a write lock on the original table
 func (this *Applier) LockOriginalTable() error {
 	query := fmt.Sprintf(`lock /* gh-ost */ tables %s.%s write`,
@@ -1194,6 +1229,10 @@ func (this *Applier) ApplyDMLEventQueries(dmlEvents [](*binlog.BinlogDMLEvent)) 
 	}
 	this.migrationContext.Log.Debugf("ApplyDMLEventQueries() applied %d events in one transaction", len(dmlEvents))
 	return nil
+}
+
+func buildCheckSumSQL(min, max *sql.ColumnValues) string {
+	return ""
 }
 
 func (this *Applier) Teardown() {

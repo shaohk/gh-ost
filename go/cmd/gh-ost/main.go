@@ -109,6 +109,9 @@ func main() {
 	cutOverLockTimeoutSeconds := flag.Int64("cut-over-lock-timeout-seconds", 3, "Max number of seconds to hold locks on tables while attempting to cut-over (retry attempted when lock exceeds timeout)")
 	niceRatio := flag.Float64("nice-ratio", 0, "force being 'nice', imply sleep time per chunk time; range: [0.0..100.0]. Example values: 0 is aggressive. 1: for every 1ms spent copying rows, sleep additional 1ms (effectively doubling runtime); 0.7: for every 10ms spend in a rowcopy chunk, spend 7ms sleeping immediately after")
 
+	flag.BoolVar(&migrationContext.EnableCheckSum, "enable-checksum", false, "Enable perform checksum check on the data between the original table and the gho table.")
+	checkSumSize := flag.Int("checksum-size", 100, "the checksum chan size, default 1000")
+
 	maxLagMillis := flag.Int64("max-lag-millis", 1500, "replication lag at which to throttle operation")
 	replicationLagQuery := flag.String("replication-lag-query", "", "Deprecated. gh-ost uses an internal, subsecond resolution query")
 	throttleControlReplicas := flag.String("throttle-control-replicas", "", "List of replicas on which to check for lag; comma delimited. Example: myhost1.com:3306,myhost2.com,myhost3.com:3307")
@@ -309,6 +312,18 @@ func main() {
 	}
 	if err := migrationContext.SetExponentialBackoffMaxInterval(*exponentialBackoffMaxInterval); err != nil {
 		migrationContext.Log.Errore(err)
+	}
+
+	if migrationContext.EnableCheckSum {
+		if *checkSumSize < 10 {
+			*checkSumSize = 10
+		}
+
+		if *checkSumSize > 1000 {
+			*checkSumSize = 1000
+		}
+
+		migrationContext.CheckSumChunkSize = *checkSumSize
 	}
 
 	log.Infof("starting gh-ost %+v (git commit: %s)", AppVersion, GitCommit)
