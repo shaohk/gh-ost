@@ -687,36 +687,33 @@ func (this *Applier) ApplyIterationInsertQuery(iterationRangeValues *base.Iterat
 	return chunkSize, rowsAffected, duration, nil
 }
 
-func (this *Applier) CheckSumChunk(chunk *checkSumChunk) (err error) {
-	if chunk.checkSQLQuery == "" {
-		chunk.checkSQLQuery, chunk.checkSQLArgs, err = sql.BuildRangeCheckSumPreparedQuery(
-			this.migrationContext.DatabaseName,
-			this.migrationContext.OriginalTableName,
-			this.migrationContext.GetGhostTableName(),
-			this.migrationContext.SharedColumns.Names(),
-			this.migrationContext.MappedSharedColumns.Names(),
-			this.migrationContext.UniqueKey.Name,
-			&this.migrationContext.UniqueKey.Columns,
-			chunk.min.AbstractValues(),
-			chunk.max.AbstractValues(),
-			this.migrationContext.GetIteration() == 0,
-			this.migrationContext.IsTransactionalTable(),
-			1024,
-		)
-		if err != nil {
-			return err
-		}
-		chunk.firstCheckTime = time.Now()
-	}
-
-	var result int
-	err = this.db.QueryRow(chunk.checkSQLQuery, chunk.checkSQLArgs...).Scan(&result)
+func (this *Applier) ChecksumQuery(checksumData checksum) (err error) {
+	query, args, err := checksumData.buildCheckSQL(
+		this.migrationContext.DatabaseName,
+		this.migrationContext.OriginalTableName,
+		this.migrationContext.GetGhostTableName(),
+		this.migrationContext.SharedColumns.Names(),
+		this.migrationContext.MappedSharedColumns.Names(),
+		this.migrationContext.UniqueKey.Name,
+		&this.migrationContext.UniqueKey.Columns,
+		this.migrationContext.IsTransactionalTable(),
+		1024,
+	)
 	if err != nil {
 		return err
 	}
 
+	if query == "" {
+		return nil
+	}
+
+	var result int
+	err = this.db.QueryRow(query, args...).Scan(&result)
+	if err != nil {
+		return err
+	}
 	if result > 0 {
-		return fmt.Errorf("checksum inconsistent checksum sql: %s, args: %s", chunk.checkSQLQuery, chunk.checkSQLArgs)
+		return fmt.Errorf("checksum inconsistent checksum sql: %s, args: %s", query, args)
 	}
 
 	return nil
@@ -1289,12 +1286,13 @@ func (this *Applier) generateReplaceQuery(uniqueKeyValuesList [][]string) string
 }
 
 // ApplyDMLEventQueries applies multiple DML queries onto the _ghost_ table
-func (this *Applier) ApplyDMLEventQueries(dmlEvents [](*binlog.BinlogDMLEvent)) error {
+func (this *Applier) ApplyDMLEventQueries(dmlEvents [](*binlog.BinlogDMLEvent), checksumQueue chan checksum) error {
 	var totalDelta int64
 	var dmlEventSize int64
 	var ignoredEventSize int64
 
 	var err error
+	var checksumValues [][]interface{}
 
 	dbTxFunc := func(applyFunc func(*gosql.Tx) error) error {
 		tx, err := this.db.Begin()
@@ -1357,6 +1355,7 @@ func (this *Applier) ApplyDMLEventQueries(dmlEvents [](*binlog.BinlogDMLEvent)) 
 					return err
 				}
 				dmlMap[strings.Join(values, ValSep)] = buildResult
+				checksumValues = append(checksumValues, buildResult.uniqueValues)
 			}
 		}
 		delArgs := make([][]string, 0)
@@ -1422,13 +1421,14 @@ func (this *Applier) ApplyDMLEventQueries(dmlEvents [](*binlog.BinlogDMLEvent)) 
 				if buildResult.err != nil {
 					return buildResult.err
 				}
+
 				result, err := tx.Exec(buildResult.query, buildResult.args...)
 				if err != nil {
 					err = fmt.Errorf("%w; query=%s; args=%+v", err, buildResult.query, buildResult.args)
 					return err
 				}
-
 				resultFunc(result, buildResult.rowsDelta)
+				checksumValues = append(checksumValues, buildResult.uniqueValues)
 			}
 		}
 		return nil
@@ -1451,6 +1451,11 @@ func (this *Applier) ApplyDMLEventQueries(dmlEvents [](*binlog.BinlogDMLEvent)) 
 		atomic.AddInt64(&this.migrationContext.RowsDeltaEstimate, totalDelta)
 	}
 	this.migrationContext.Log.Debugf("ApplyDMLEventQueries() applied %d events in one transaction", len(dmlEvents))
+
+	// checksum
+	if this.migrationContext.EnableCheckSum {
+		checksumQueue <- newChecksumDMLEvents(checksumValues)
+	}
 	return nil
 }
 
