@@ -112,6 +112,9 @@ func main() {
 	flag.BoolVar(&migrationContext.IgnoreOverIterationRangeMaxBinlog, "ignore-over-iteration-range-max-binlog", false, "When binlog unique key value is over MigrationIterationRangeMaxValues, and less than MigrationRangeMaxValues, the binlog will be ignored. Because the data will be synced by copy chunk")
 	flag.BoolVar(&migrationContext.IsMergeDMLEvents, "is-merge-dml-event", false, "Merge DML Binlog Event")
 
+	flag.BoolVar(&migrationContext.EnableCheckSum, "enable-checksum", false, "Enable perform checksum check on the data between the original table and the gho table.")
+	checkSumSize := flag.Int("checksum-size", 100, "the checksum chan size, default 1000")
+
 	maxLagMillis := flag.Int64("max-lag-millis", 1500, "replication lag at which to throttle operation")
 	replicationLagQuery := flag.String("replication-lag-query", "", "Deprecated. gh-ost uses an internal, subsecond resolution query")
 	throttleControlReplicas := flag.String("throttle-control-replicas", "", "List of replicas on which to check for lag; comma delimited. Example: myhost1.com:3306,myhost2.com,myhost3.com:3307")
@@ -313,6 +316,18 @@ func main() {
 	}
 	if err := migrationContext.SetExponentialBackoffMaxInterval(*exponentialBackoffMaxInterval); err != nil {
 		migrationContext.Log.Errore(err)
+	}
+
+	if migrationContext.EnableCheckSum {
+		if *checkSumSize < 10 {
+			*checkSumSize = 10
+		}
+
+		if *checkSumSize > 1000 {
+			*checkSumSize = 1000
+		}
+
+		migrationContext.CheckSumChunkSize = *checkSumSize
 	}
 
 	log.Infof("starting gh-ost %+v (git commit: %s)", AppVersion, GitCommit)

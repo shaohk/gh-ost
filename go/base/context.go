@@ -243,6 +243,9 @@ type MigrationContext struct {
 	CalculateNextIterationRangeEndValuesLock *sync.Mutex
 	ForceTmpTableName                        string
 
+	EnableCheckSum    bool
+	CheckSumChunkSize int
+
 	recentBinlogCoordinates mysql.BinlogCoordinates
 
 	BinlogSyncerMaxReconnectAttempts int

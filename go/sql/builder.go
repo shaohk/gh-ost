@@ -247,6 +247,95 @@ func BuildRangeInsertPreparedQuery(databaseName, originalTableName, ghostTableNa
 	return BuildRangeInsertQuery(databaseName, originalTableName, ghostTableName, sharedColumns, mappedSharedColumns, uniqueKey, uniqueKeyColumns, rangeStartValues, rangeEndValues, rangeStartArgs, rangeEndArgs, includeRangeStartValues, transactionalTable)
 }
 
+func BuildRangeCheckSumQuery(databaseName, originalTableName, ghostTableName string, sharedColumns []string, mappedSharedColumns []string, uniqueKey string, uniqueKeyColumns *ColumnList, rangeStartValues, rangeEndValues []string, rangeStartArgs, rangeEndArgs []interface{}, includeRangeStartValues bool, transactionalTable bool, checkColumnSize int) (result string, explodedArgs []interface{}, err error) {
+	if len(sharedColumns) == 0 {
+		return "", explodedArgs, fmt.Errorf("Got 0 shared columns in BuildRangeInsertQuery")
+	}
+	databaseName = EscapeName(databaseName)
+	originalTableName = EscapeName(originalTableName)
+	ghostTableName = EscapeName(ghostTableName)
+
+	mappedSharedColumns = duplicateNames(mappedSharedColumns)
+	for i := range mappedSharedColumns {
+		if checkColumnSize <= 0 {
+			mappedSharedColumns[i] = EscapeName(mappedSharedColumns[i])
+			continue
+		}
+		mappedSharedColumns[i] = fmt.Sprintf(`substring(ifnull(cast(%s as char), 'null'), 1, 1024)`, EscapeName(mappedSharedColumns[i]))
+	}
+	mappedSharedColumnsListing := strings.Join(mappedSharedColumns, ", ")
+
+	sharedColumns = duplicateNames(sharedColumns)
+	for i := range sharedColumns {
+		if checkColumnSize <= 0 {
+			sharedColumns[i] = EscapeName(sharedColumns[i])
+			continue
+		}
+		sharedColumns[i] = fmt.Sprintf(`substring(ifnull(cast(%s as char), 'null'), 1, 1024)`, EscapeName(sharedColumns[i]))
+	}
+	sharedColumnsListing := strings.Join(sharedColumns, ", ")
+
+	uniqueKey = EscapeName(uniqueKey)
+	var minRangeComparisonSign ValueComparisonSign = GreaterThanComparisonSign
+	if includeRangeStartValues {
+		minRangeComparisonSign = GreaterThanOrEqualsComparisonSign
+	}
+	rangeStartComparison, rangeExplodedArgs, err := BuildRangeComparison(uniqueKeyColumns.Names(), rangeStartValues, rangeStartArgs, minRangeComparisonSign)
+	if err != nil {
+		return "", explodedArgs, err
+	}
+	explodedArgs = append(explodedArgs, rangeExplodedArgs...)
+	rangeEndComparison, rangeExplodedArgs, err := BuildRangeComparison(uniqueKeyColumns.Names(), rangeEndValues, rangeEndArgs, LessThanOrEqualsComparisonSign)
+	if err != nil {
+		return "", explodedArgs, err
+	}
+	explodedArgs = append(explodedArgs, rangeExplodedArgs...)
+	explodedArgs = append(explodedArgs, explodedArgs...)
+	transactionalClause := ""
+	if transactionalTable {
+		transactionalClause = "lock in share mode"
+	}
+	result = fmt.Sprintf(`
+		select /* gh-ost %s.%s */ sum(consistency_check)  from (
+		    select
+				  if(sum(checksum_value) = 0, 0, 1) AS consistency_check
+			from (
+				select /* original table */
+					crc32(concat_ws(',', %s)) as row_checksum,
+				    1 as checksum_value
+				from
+					%s.%s force index (%s)
+				where
+					(%s and %s) %s
+				    
+				union all
+				    
+				select /* gh-ost table */
+					crc32(concat_ws(',', %s)) as row_checksum,
+				    -1 as checksum_value
+				from
+					%s.%s FORCE index (%s)
+				where
+				    (%s and %s) %s
+			) as combined
+			group by row_checksum
+		) as result`,
+		databaseName, originalTableName,
+		sharedColumnsListing,
+		databaseName, originalTableName, uniqueKey,
+		rangeStartComparison, rangeEndComparison, transactionalClause,
+		mappedSharedColumnsListing,
+		databaseName, ghostTableName, uniqueKey,
+		rangeStartComparison, rangeEndComparison, transactionalClause)
+	return result, explodedArgs, nil
+}
+
+func BuildRangeCheckSumPreparedQuery(databaseName, originalTableName, ghostTableName string, sharedColumns []string, mappedSharedColumns []string, uniqueKey string, uniqueKeyColumns *ColumnList, rangeStartArgs, rangeEndArgs []interface{}, includeRangeStartValues bool, transactionalTable bool, checkColumnSize int) (result string, explodedArgs []interface{}, err error) {
+	rangeStartValues := buildColumnsPreparedValues(uniqueKeyColumns)
+	rangeEndValues := buildColumnsPreparedValues(uniqueKeyColumns)
+	return BuildRangeCheckSumQuery(databaseName, originalTableName, ghostTableName, sharedColumns, mappedSharedColumns, uniqueKey, uniqueKeyColumns, rangeStartValues, rangeEndValues, rangeStartArgs, rangeEndArgs, includeRangeStartValues, transactionalTable, checkColumnSize)
+}
+
 func BuildUniqueKeyRangeEndPreparedQueryViaOffset(databaseName, tableName string, uniqueKeyColumns *ColumnList, rangeStartArgs, rangeEndArgs []interface{}, chunkSize int64, includeRangeStartValues bool, hint string) (result string, explodedArgs []interface{}, err error) {
 	if uniqueKeyColumns.Len() == 0 {
 		return "", explodedArgs, fmt.Errorf("Got 0 columns in BuildUniqueKeyRangeEndPreparedQuery")

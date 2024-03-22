@@ -67,6 +67,26 @@ const (
 	ForcePrintStatusAndHintRule                 = iota
 )
 
+type checkSumChunk struct {
+	min        *sql.ColumnValues
+	max        *sql.ColumnValues
+	includeMin bool
+
+	checkSQLQuery string
+	checkSQLArgs  []interface{}
+
+	firstCheckTime time.Time
+}
+
+func newCheckSumChunk(min *sql.ColumnValues, max *sql.ColumnValues, includeMin bool) *checkSumChunk {
+	return &checkSumChunk{
+		min:           min,
+		max:           max,
+		includeMin:    includeMin,
+		checkSQLQuery: "",
+	}
+}
+
 // Migrator is the main schema migration flow manager.
 type Migrator struct {
 	appVersion       string
@@ -90,6 +110,10 @@ type Migrator struct {
 	copyRowsQueue    chan tableWriteFunc
 	applyEventsQueue chan *applyEventStruct
 
+	checkSumChunksQueue      chan *checkSumChunk
+	checkSumRetryChunksQueue chan *checkSumChunk
+	checkSumCount            int64
+
 	handledChangelogStates map[string]bool
 
 	finishedMigrating int64
@@ -106,10 +130,12 @@ func NewMigrator(context *base.MigrationContext, appVersion string) *Migrator {
 		rowCopyComplete:            make(chan error),
 		allEventsUpToLockProcessed: make(chan string),
 
-		copyRowsQueue:          make(chan tableWriteFunc),
-		applyEventsQueue:       make(chan *applyEventStruct, base.MaxEventsBatchSize),
-		handledChangelogStates: make(map[string]bool),
-		finishedMigrating:      0,
+		copyRowsQueue:            make(chan tableWriteFunc),
+		applyEventsQueue:         make(chan *applyEventStruct, base.MaxEventsBatchSize),
+		checkSumChunksQueue:      make(chan *checkSumChunk, context.CheckSumChunkSize),
+		checkSumRetryChunksQueue: make(chan *checkSumChunk, context.CheckSumChunkSize),
+		handledChangelogStates:   make(map[string]bool),
+		finishedMigrating:        0,
 	}
 	return migrator
 }
@@ -183,6 +209,11 @@ func (this *Migrator) retryOperationWithExponentialBackoff(operation func() erro
 func (this *Migrator) consumeRowCopyComplete() {
 	if err := <-this.rowCopyComplete; err != nil {
 		this.migrationContext.PanicAbort <- err
+	}
+	unfinishedCheckSumCount := atomic.LoadInt64(&this.checkSumCount)
+	for unfinishedCheckSumCount > 0 {
+		time.Sleep(time.Duration(unfinishedCheckSumCount*10) * time.Millisecond)
+		unfinishedCheckSumCount = atomic.LoadInt64(&this.checkSumCount)
 	}
 	atomic.StoreInt64(&this.rowCopyCompleteFlag, 1)
 	this.migrationContext.MarkRowCopyEndTime()
@@ -409,6 +440,7 @@ func (this *Migrator) Migrate() (err error) {
 		return err
 	}
 	go this.executeWriteFuncs()
+	go this.checksumChunks()
 	go this.iterateChunks()
 	this.migrationContext.MarkRowCopyStartTime()
 	go this.initiateStatus()
@@ -1242,6 +1274,12 @@ func (this *Migrator) iterateChunks() error {
 						return err
 					}
 
+					// put the chunk into checkSum chan
+					if this.migrationContext.EnableCheckSum {
+						this.checkSumChunksQueue <- newCheckSumChunk(iterationRangeValues.Min, iterationRangeValues.Max, iterationRangeValues.IsIncludeMinValues)
+						atomic.AddInt64(&this.checkSumCount, 1)
+					}
+
 					return nil
 				})
 			}
@@ -1250,15 +1288,39 @@ func (this *Migrator) iterateChunks() error {
 				return terminateRowIteration(err)
 			}
 
-			if atomic.LoadInt64(&hasNoFurtherRangeFlag) == 1 {
-				return terminateRowIteration(nil)
-			}
-
 			return nil
 		}
 		// Enqueue copy operation; to be executed by executeWriteFuncs()
 		this.copyRowsQueue <- copyRowsFunc
 	}
+}
+
+func (this *Migrator) checksumChunks() error {
+	if !this.migrationContext.EnableCheckSum {
+		return nil
+	}
+
+	timeout := time.NewTimer(time.Second)
+	for {
+		if atomic.LoadInt64(&this.finishedMigrating) == 1 {
+			break
+		}
+
+		select {
+		case chunk := <-this.checkSumChunksQueue:
+			{
+				err := this.applier.CheckSumChunk(chunk)
+				if err != nil {
+					this.checkSumRetryChunksQueue <- chunk
+				} else {
+					atomic.AddInt64(&this.checkSumCount, -1)
+				}
+			}
+		case <-timeout.C:
+			break
+		}
+	}
+	return nil
 }
 
 func (this *Migrator) onApplyEventStruct(eventStruct *applyEventStruct) error {
@@ -1339,26 +1401,43 @@ func (this *Migrator) executeWriteFuncs() error {
 		default:
 			{
 				select {
-				case copyRowsFunc := <-this.copyRowsQueue:
+				case chunk := <-this.checkSumRetryChunksQueue:
 					{
-						copyRowsStartTime := time.Now()
-						// Retries are handled within the copyRowsFunc
-						if err := copyRowsFunc(); err != nil {
-							return this.migrationContext.Log.Errore(err)
-						}
-						if niceRatio := this.migrationContext.GetNiceRatio(); niceRatio > 0 {
-							copyRowsDuration := time.Since(copyRowsStartTime)
-							sleepTimeNanosecondFloat64 := niceRatio * float64(copyRowsDuration.Nanoseconds())
-							sleepTime := time.Duration(int64(sleepTimeNanosecondFloat64)) * time.Nanosecond
-							time.Sleep(sleepTime)
+						err := this.applier.CheckSumChunk(chunk)
+						if err != nil {
+							if chunk.firstCheckTime.Before(this.migrationContext.GetLastHeartbeatOnChangelogTime()) {
+								return this.migrationContext.Log.Errore(err)
+							}
+							this.checkSumRetryChunksQueue <- chunk
+						} else {
+							atomic.AddInt64(&this.checkSumCount, -1)
 						}
 					}
 				default:
 					{
-						// Hmmmmm... nothing in the queue; no events, but also no row copy.
-						// This is possible upon load. Let's just sleep it over.
-						this.migrationContext.Log.Debugf("Getting nothing in the write queue. Sleeping...")
-						time.Sleep(time.Second)
+						select {
+						case copyRowsFunc := <-this.copyRowsQueue:
+							{
+								copyRowsStartTime := time.Now()
+								// Retries are handled within the copyRowsFunc
+								if err := copyRowsFunc(); err != nil {
+									return this.migrationContext.Log.Errore(err)
+								}
+								if niceRatio := this.migrationContext.GetNiceRatio(); niceRatio > 0 {
+									copyRowsDuration := time.Since(copyRowsStartTime)
+									sleepTimeNanosecondFloat64 := niceRatio * float64(copyRowsDuration.Nanoseconds())
+									sleepTime := time.Duration(int64(sleepTimeNanosecondFloat64)) * time.Nanosecond
+									time.Sleep(sleepTime)
+								}
+							}
+						default:
+							{
+								// Hmmmmm... nothing in the queue; no events, but also no row copy.
+								// This is possible upon load. Let's just sleep it over.
+								this.migrationContext.Log.Debugf("Getting nothing in the write queue. Sleeping...")
+								time.Sleep(time.Second)
+							}
+						}
 					}
 				}
 			}
