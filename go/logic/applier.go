@@ -76,6 +76,7 @@ func (this *Applier) InitDBConnections() (err error) {
 	if this.db, _, err = mysql.GetDB(this.migrationContext.Uuid, applierUri); err != nil {
 		return err
 	}
+	this.db.SetMaxOpenConns(10)
 	singletonApplierUri := fmt.Sprintf("%s&timeout=0", applierUri)
 	if this.singletonDB, _, err = mysql.GetDB(this.migrationContext.Uuid, singletonApplierUri); err != nil {
 		return err
@@ -670,36 +671,33 @@ func (this *Applier) ApplyIterationInsertQuery() (chunkSize int64, rowsAffected 
 	return chunkSize, rowsAffected, duration, nil
 }
 
-func (this *Applier) CheckSumChunk(chunk *checkSumChunk) (err error) {
-	if chunk.checkSQLQuery == "" {
-		chunk.checkSQLQuery, chunk.checkSQLArgs, err = sql.BuildRangeCheckSumPreparedQuery(
-			this.migrationContext.DatabaseName,
-			this.migrationContext.OriginalTableName,
-			this.migrationContext.GetGhostTableName(),
-			this.migrationContext.SharedColumns.Names(),
-			this.migrationContext.MappedSharedColumns.Names(),
-			this.migrationContext.UniqueKey.Name,
-			&this.migrationContext.UniqueKey.Columns,
-			chunk.min.AbstractValues(),
-			chunk.max.AbstractValues(),
-			this.migrationContext.GetIteration() == 0,
-			this.migrationContext.IsTransactionalTable(),
-			1024,
-		)
-		if err != nil {
-			return err
-		}
-		chunk.firstCheckTime = time.Now()
-	}
-
-	var result int
-	err = this.db.QueryRow(chunk.checkSQLQuery, chunk.checkSQLArgs...).Scan(&result)
+func (this *Applier) ChecksumQuery(checksumData checksum) (err error) {
+	query, args, err := checksumData.buildCheckSQL(
+		this.migrationContext.DatabaseName,
+		this.migrationContext.OriginalTableName,
+		this.migrationContext.GetGhostTableName(),
+		this.migrationContext.SharedColumns.Names(),
+		this.migrationContext.MappedSharedColumns.Names(),
+		this.migrationContext.UniqueKey.Name,
+		&this.migrationContext.UniqueKey.Columns,
+		this.migrationContext.IsTransactionalTable(),
+		1024,
+	)
 	if err != nil {
 		return err
 	}
 
+	if query == "" {
+		return nil
+	}
+
+	var result int
+	err = this.db.QueryRow(query, args...).Scan(&result)
+	if err != nil {
+		return err
+	}
 	if result > 0 {
-		return fmt.Errorf("checksum inconsistent checksum sql: %s, args: %s", chunk.checkSQLQuery, chunk.checkSQLArgs)
+		return fmt.Errorf("checksum inconsistent checksum sql: %s, args: %s", query, args)
 	}
 
 	return nil
