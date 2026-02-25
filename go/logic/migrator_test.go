@@ -240,6 +240,55 @@ func TestMigratorGetMigrationStateAndETA(t *testing.T) {
 	}
 }
 
+func TestMigratorConcurrentRowCopyChannelBuffering(t *testing.T) {
+	{
+		migrationContext := base.NewMigrationContext()
+		migrator := NewMigrator(migrationContext, "1.2.3")
+		tests.S(t).ExpectEquals(cap(migrator.copyRowsQueue), 0)
+	}
+	{
+		migrationContext := base.NewMigrationContext()
+		migrationContext.SetConcurrentRowCopy(4)
+		migrator := NewMigrator(migrationContext, "1.2.3")
+		tests.S(t).ExpectEquals(cap(migrator.copyRowsQueue), 8)
+	}
+	{
+		migrationContext := base.NewMigrationContext()
+		migrationContext.SetConcurrentRowCopy(1)
+		migrator := NewMigrator(migrationContext, "1.2.3")
+		tests.S(t).ExpectEquals(cap(migrator.copyRowsQueue), 0)
+	}
+}
+
+func TestMigratorIterateChunksNoopConcurrent(t *testing.T) {
+	migrationContext := base.NewMigrationContext()
+	migrationContext.SetConcurrentRowCopy(4)
+	migrator := NewMigrator(migrationContext, "1.2.3")
+	migrator.migrationContext.Noop = true
+
+	go func() {
+		err := <-migrator.rowCopyComplete
+		tests.S(t).ExpectNil(err)
+	}()
+
+	err := migrator.iterateChunks()
+	tests.S(t).ExpectNil(err)
+}
+
+func TestMigratorIterateChunksEmptyTableConcurrent(t *testing.T) {
+	migrationContext := base.NewMigrationContext()
+	migrationContext.SetConcurrentRowCopy(4)
+	migrator := NewMigrator(migrationContext, "1.2.3")
+
+	go func() {
+		err := <-migrator.rowCopyComplete
+		tests.S(t).ExpectNil(err)
+	}()
+
+	err := migrator.iterateChunks()
+	tests.S(t).ExpectNil(err)
+}
+
 func TestMigratorShouldPrintStatus(t *testing.T) {
 	migrationContext := base.NewMigrationContext()
 	migrator := NewMigrator(migrationContext, "1.2.3")

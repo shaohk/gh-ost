@@ -116,6 +116,7 @@ type MigrationContext struct {
 	CliMasterUser     string
 	CliMasterPassword string
 
+	ConcurrentRowCopy                   int64
 	HeartbeatIntervalMilliseconds       int64
 	defaultNumRetries                   int64
 	ChunkSize                           int64
@@ -270,6 +271,7 @@ type ContextConfig struct {
 func NewMigrationContext() *MigrationContext {
 	return &MigrationContext{
 		Uuid:                                uuid.NewString(),
+		ConcurrentRowCopy:                   1,
 		defaultNumRetries:                   60,
 		ChunkSize:                           1000,
 		InspectorConnectionConfig:           mysql.NewConnectionConfig(),
@@ -623,6 +625,20 @@ func (this *MigrationContext) SetChunkSize(chunkSize int64) {
 		chunkSize = 100000
 	}
 	atomic.StoreInt64(&this.ChunkSize, chunkSize)
+}
+
+func (this *MigrationContext) SetConcurrentRowCopy(n int64) {
+	if n < 1 {
+		n = 1
+	}
+	if n > 64 {
+		n = 64
+	}
+	atomic.StoreInt64(&this.ConcurrentRowCopy, n)
+}
+
+func (this *MigrationContext) GetConcurrentRowCopy() int64 {
+	return atomic.LoadInt64(&this.ConcurrentRowCopy)
 }
 
 func (this *MigrationContext) SetDMLBatchSize(batchSize int64) {

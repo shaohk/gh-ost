@@ -58,6 +58,26 @@ func TestGetTableNames(t *testing.T) {
 	}
 }
 
+func TestSetConcurrentRowCopy(t *testing.T) {
+	context := NewMigrationContext()
+	test.S(t).ExpectEquals(context.GetConcurrentRowCopy(), int64(1))
+
+	context.SetConcurrentRowCopy(4)
+	test.S(t).ExpectEquals(context.GetConcurrentRowCopy(), int64(4))
+
+	context.SetConcurrentRowCopy(0)
+	test.S(t).ExpectEquals(context.GetConcurrentRowCopy(), int64(1))
+
+	context.SetConcurrentRowCopy(-5)
+	test.S(t).ExpectEquals(context.GetConcurrentRowCopy(), int64(1))
+
+	context.SetConcurrentRowCopy(100)
+	test.S(t).ExpectEquals(context.GetConcurrentRowCopy(), int64(64))
+
+	context.SetConcurrentRowCopy(64)
+	test.S(t).ExpectEquals(context.GetConcurrentRowCopy(), int64(64))
+}
+
 func TestReadConfigFile(t *testing.T) {
 	{
 		context := NewMigrationContext()

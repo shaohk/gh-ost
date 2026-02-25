@@ -670,6 +670,71 @@ func (this *Applier) ApplyIterationInsertQuery() (chunkSize int64, rowsAffected 
 	return chunkSize, rowsAffected, duration, nil
 }
 
+// ApplyIterationInsertQueryForRange issues a chunk-INSERT query with explicitly
+// provided range boundaries instead of reading them from MigrationContext.
+// This enables concurrent chunk copy where each worker operates on an
+// independently captured range.
+func (this *Applier) ApplyIterationInsertQueryForRange(
+	iterationRangeMinValues *sql.ColumnValues,
+	iterationRangeMaxValues *sql.ColumnValues,
+	includeRangeStartValues bool,
+) (chunkSize int64, rowsAffected int64, duration time.Duration, err error) {
+	startTime := time.Now()
+	chunkSize = atomic.LoadInt64(&this.migrationContext.ChunkSize)
+
+	query, explodedArgs, err := sql.BuildRangeInsertPreparedQuery(
+		this.migrationContext.DatabaseName,
+		this.migrationContext.OriginalTableName,
+		this.migrationContext.GetGhostTableName(),
+		this.migrationContext.SharedColumns.Names(),
+		this.migrationContext.MappedSharedColumns.Names(),
+		this.migrationContext.UniqueKey.Name,
+		&this.migrationContext.UniqueKey.Columns,
+		iterationRangeMinValues.AbstractValues(),
+		iterationRangeMaxValues.AbstractValues(),
+		includeRangeStartValues,
+		this.migrationContext.IsTransactionalTable(),
+	)
+	if err != nil {
+		return chunkSize, rowsAffected, duration, err
+	}
+
+	sqlResult, err := func() (gosql.Result, error) {
+		tx, err := this.db.Begin()
+		if err != nil {
+			return nil, err
+		}
+		defer tx.Rollback()
+
+		sessionQuery := fmt.Sprintf(`SET SESSION time_zone = '%s'`, this.migrationContext.ApplierTimeZone)
+		sessionQuery = fmt.Sprintf("%s, %s", sessionQuery, this.generateSqlModeQuery())
+
+		if _, err := tx.Exec(sessionQuery); err != nil {
+			return nil, err
+		}
+		result, err := tx.Exec(query, explodedArgs...)
+		if err != nil {
+			return nil, err
+		}
+		if err := tx.Commit(); err != nil {
+			return nil, err
+		}
+		return result, nil
+	}()
+
+	if err != nil {
+		return chunkSize, rowsAffected, duration, err
+	}
+	rowsAffected, _ = sqlResult.RowsAffected()
+	duration = time.Since(startTime)
+	this.migrationContext.Log.Debugf(
+		"Issued concurrent INSERT on range: [%s]..[%s]; chunk-size: %d",
+		iterationRangeMinValues,
+		iterationRangeMaxValues,
+		chunkSize)
+	return chunkSize, rowsAffected, duration, nil
+}
+
 // LockOriginalTable places a write lock on the original table
 func (this *Applier) LockOriginalTable() error {
 	query := fmt.Sprintf(`lock /* gh-ost */ tables %s.%s write`,

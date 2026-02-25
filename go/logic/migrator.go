@@ -13,6 +13,7 @@ import (
 	"math"
 	"os"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -95,6 +96,12 @@ type Migrator struct {
 }
 
 func NewMigrator(context *base.MigrationContext, appVersion string) *Migrator {
+	concurrency := context.GetConcurrentRowCopy()
+	var copyRowsQueueBuf int
+	if concurrency > 1 {
+		copyRowsQueueBuf = int(concurrency) * 2
+	}
+
 	migrator := &Migrator{
 		appVersion:                 appVersion,
 		hooksExecutor:              NewHooksExecutor(context),
@@ -105,7 +112,7 @@ func NewMigrator(context *base.MigrationContext, appVersion string) *Migrator {
 		rowCopyComplete:            make(chan error),
 		allEventsUpToLockProcessed: make(chan string),
 
-		copyRowsQueue:          make(chan tableWriteFunc),
+		copyRowsQueue:          make(chan tableWriteFunc, copyRowsQueueBuf),
 		applyEventsQueue:       make(chan *applyEventStruct, base.MaxEventsBatchSize),
 		handledChangelogStates: make(map[string]bool),
 		finishedMigrating:      0,
@@ -407,7 +414,16 @@ func (this *Migrator) Migrate() (err error) {
 	if err := this.hooksExecutor.onBeforeRowCopy(); err != nil {
 		return err
 	}
-	go this.executeWriteFuncs()
+	concurrency := this.migrationContext.GetConcurrentRowCopy()
+	if concurrency > 1 {
+		this.migrationContext.Log.Infof("Using %d concurrent row-copy workers", concurrency)
+		go this.executeEventsFuncs()
+		for i := int64(0); i < concurrency; i++ {
+			go this.executeCopyWorker()
+		}
+	} else {
+		go this.executeWriteFuncs()
+	}
 	go this.iterateChunks()
 	this.migrationContext.MarkRowCopyStartTime()
 	go this.initiateStatus()
@@ -838,10 +854,11 @@ func (this *Migrator) printMigrationStatusHint(writers ...io.Writer) {
 	)
 	maxLoad := this.migrationContext.GetMaxLoad()
 	criticalLoad := this.migrationContext.GetCriticalLoad()
-	fmt.Fprintf(w, "# chunk-size: %+v; max-lag-millis: %+vms; dml-batch-size: %+v; max-load: %s; critical-load: %s; nice-ratio: %f\n",
+	fmt.Fprintf(w, "# chunk-size: %+v; max-lag-millis: %+vms; dml-batch-size: %+v; concurrent-row-copy: %+v; max-load: %s; critical-load: %s; nice-ratio: %f\n",
 		atomic.LoadInt64(&this.migrationContext.ChunkSize),
 		atomic.LoadInt64(&this.migrationContext.MaxLagMillisecondsThrottleThreshold),
 		atomic.LoadInt64(&this.migrationContext.DMLBatchSize),
+		this.migrationContext.GetConcurrentRowCopy(),
 		maxLoad.String(),
 		criticalLoad.String(),
 		this.migrationContext.GetNiceRatio(),
@@ -1173,22 +1190,26 @@ func (this *Migrator) iterateChunks() error {
 		return terminateRowIteration(nil)
 	}
 
+	concurrency := this.migrationContext.GetConcurrentRowCopy()
+	if concurrency > 1 {
+		return this.iterateChunksConcurrent(terminateRowIteration, concurrency)
+	}
+	return this.iterateChunksSequential(terminateRowIteration)
+}
+
+// iterateChunksSequential is the original single-threaded chunk iteration path.
+// Range calculation and chunk INSERT both happen inside the closure executed by
+// executeWriteFuncs, preserving the original serialized behavior.
+func (this *Migrator) iterateChunksSequential(terminateRowIteration func(error) error) error {
 	var hasNoFurtherRangeFlag int64
-	// Iterate per chunk:
 	for {
 		if atomic.LoadInt64(&this.rowCopyCompleteFlag) == 1 || atomic.LoadInt64(&hasNoFurtherRangeFlag) == 1 {
-			// Done
-			// There's another such check down the line
 			return nil
 		}
 		copyRowsFunc := func() error {
 			if atomic.LoadInt64(&this.rowCopyCompleteFlag) == 1 || atomic.LoadInt64(&hasNoFurtherRangeFlag) == 1 {
-				// Done.
-				// There's another such check down the line
 				return nil
 			}
-
-			// When hasFurtherRange is false, original table might be write locked and CalculateNextIterationRangeEndValues would hangs forever
 
 			hasFurtherRange := false
 			if err := this.retryOperation(func() (e error) {
@@ -1201,22 +1222,13 @@ func (this *Migrator) iterateChunks() error {
 				atomic.StoreInt64(&hasNoFurtherRangeFlag, 1)
 				return terminateRowIteration(nil)
 			}
-			// Copy task:
 			applyCopyRowsFunc := func() error {
 				if atomic.LoadInt64(&this.rowCopyCompleteFlag) == 1 {
-					// No need for more writes.
-					// This is the de-facto place where we avoid writing in the event of completed cut-over.
-					// There could _still_ be a race condition, but that's as close as we can get.
-					// What about the race condition? Well, there's actually no data integrity issue.
-					// when rowCopyCompleteFlag==1 that means **guaranteed** all necessary rows have been copied.
-					// But some are still then collected at the binary log, and these are the ones we're trying to
-					// not apply here. If the race condition wins over us, then we just attempt to apply onto the
-					// _ghost_ table, which no longer exists. So, bothering error messages and all, but no damage.
 					return nil
 				}
 				_, rowsAffected, _, err := this.applier.ApplyIterationInsertQuery()
 				if err != nil {
-					return err // wrapping call will retry
+					return err
 				}
 				atomic.AddInt64(&this.migrationContext.TotalRowsCopied, rowsAffected)
 				atomic.AddInt64(&this.migrationContext.Iteration, 1)
@@ -1227,9 +1239,92 @@ func (this *Migrator) iterateChunks() error {
 			}
 			return nil
 		}
-		// Enqueue copy operation; to be executed by executeWriteFuncs()
 		this.copyRowsQueue <- copyRowsFunc
 	}
+}
+
+// iterateChunksConcurrent calculates chunk ranges sequentially (each range
+// depends on the previous one), then dispatches the INSERT work to concurrent
+// copy workers via the buffered copyRowsQueue. Each closure captures its own
+// immutable range boundaries so workers can execute independently.
+func (this *Migrator) iterateChunksConcurrent(terminateRowIteration func(error) error, concurrency int64) error {
+	var hasNoFurtherRangeFlag int64
+	isFirstChunk := true
+	var wg sync.WaitGroup
+	errCh := make(chan error, concurrency)
+
+	for {
+		if atomic.LoadInt64(&this.rowCopyCompleteFlag) == 1 || atomic.LoadInt64(&hasNoFurtherRangeFlag) == 1 {
+			break
+		}
+
+		select {
+		case err := <-errCh:
+			wg.Wait()
+			return terminateRowIteration(err)
+		default:
+		}
+
+		hasFurtherRange := false
+		if err := this.retryOperation(func() (e error) {
+			hasFurtherRange, e = this.applier.CalculateNextIterationRangeEndValues()
+			return e
+		}); err != nil {
+			wg.Wait()
+			return terminateRowIteration(err)
+		}
+		if !hasFurtherRange {
+			atomic.StoreInt64(&hasNoFurtherRangeFlag, 1)
+			break
+		}
+
+		rangeMin := this.migrationContext.MigrationIterationRangeMinValues
+		rangeMax := this.migrationContext.MigrationIterationRangeMaxValues
+		includeStart := isFirstChunk
+		isFirstChunk = false
+
+		wg.Add(1)
+		copyRowsFunc := func() error {
+			defer wg.Done()
+			if atomic.LoadInt64(&this.rowCopyCompleteFlag) == 1 {
+				return nil
+			}
+
+			applyCopyRowsFunc := func() error {
+				if atomic.LoadInt64(&this.rowCopyCompleteFlag) == 1 {
+					return nil
+				}
+				_, rowsAffected, _, err := this.applier.ApplyIterationInsertQueryForRange(
+					rangeMin, rangeMax, includeStart)
+				if err != nil {
+					return err
+				}
+				atomic.AddInt64(&this.migrationContext.TotalRowsCopied, rowsAffected)
+				atomic.AddInt64(&this.migrationContext.Iteration, 1)
+				return nil
+			}
+			if err := this.retryOperation(applyCopyRowsFunc); err != nil {
+				select {
+				case errCh <- err:
+				default:
+				}
+				return err
+			}
+			return nil
+		}
+
+		this.copyRowsQueue <- copyRowsFunc
+	}
+
+	wg.Wait()
+
+	select {
+	case err := <-errCh:
+		return terminateRowIteration(err)
+	default:
+	}
+
+	return terminateRowIteration(nil)
 }
 
 func (this *Migrator) onApplyEventStruct(eventStruct *applyEventStruct) error {
@@ -1281,6 +1376,70 @@ func (this *Migrator) onApplyEventStruct(eventStruct *applyEventStruct) error {
 		}
 	}
 	return nil
+}
+
+// executeEventsFuncs is used in concurrent-row-copy mode. It processes only
+// binlog DML events from the applyEventsQueue, while row-copy work is handled
+// by separate executeCopyWorker goroutines.
+func (this *Migrator) executeEventsFuncs() error {
+	if this.migrationContext.Noop {
+		this.migrationContext.Log.Debugf("Noop operation; not really executing event funcs")
+		return nil
+	}
+	for {
+		if atomic.LoadInt64(&this.finishedMigrating) > 0 {
+			return nil
+		}
+
+		this.throttler.throttle(nil)
+
+		select {
+		case eventStruct := <-this.applyEventsQueue:
+			{
+				if err := this.onApplyEventStruct(eventStruct); err != nil {
+					return err
+				}
+			}
+		default:
+			{
+				time.Sleep(10 * time.Millisecond)
+			}
+		}
+	}
+}
+
+// executeCopyWorker is a concurrent row-copy worker. Multiple instances run in
+// parallel, each pulling chunk-copy tasks from the buffered copyRowsQueue.
+// Each worker independently respects throttling and the nice-ratio sleep.
+func (this *Migrator) executeCopyWorker() {
+	for {
+		if atomic.LoadInt64(&this.finishedMigrating) > 0 {
+			return
+		}
+		if atomic.LoadInt64(&this.rowCopyCompleteFlag) == 1 {
+			return
+		}
+
+		this.throttler.throttle(nil)
+
+		select {
+		case copyRowsFunc := <-this.copyRowsQueue:
+			{
+				copyRowsStartTime := time.Now()
+				copyRowsFunc()
+				if niceRatio := this.migrationContext.GetNiceRatio(); niceRatio > 0 {
+					copyRowsDuration := time.Since(copyRowsStartTime)
+					sleepTimeNanosecondFloat64 := niceRatio * float64(copyRowsDuration.Nanoseconds())
+					sleepTime := time.Duration(int64(sleepTimeNanosecondFloat64)) * time.Nanosecond
+					time.Sleep(sleepTime)
+				}
+			}
+		default:
+			{
+				time.Sleep(100 * time.Millisecond)
+			}
+		}
+	}
 }
 
 // executeWriteFuncs writes data via applier: both the rowcopy and the events backlog.
